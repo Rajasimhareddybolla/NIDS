@@ -1,0 +1,43 @@
+project:
+  name: nids-realtime
+  environment: local
+  timezone: UTC
+
+paths:
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+  model_dir: models
+  log_dir: logs
+  dynamic_params: config/dynamic_params.json
+
+dataset:
+  sample_rows: 10000
+  label_column: Label
+  timestamp_column: Timestamp
+  train_files:
+    - Monday-WorkingHours.pcap_ISCX.csv
+    - Tuesday-WorkingHours.pcap_ISCX.csv
+    - Wednesday-workingHours.pcap_ISCX.csv
+    - Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv
+    - Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv
+  validation_files:
+    - Friday-WorkingHours-Morning.pcap_ISCX.csv
+    - Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv
+    - Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv
+
+streaming:
+  topic: network-telemetry
+  max_offsets_per_trigger: 10000
+  trigger_interval_seconds: 5
+  checkpoint_dir: checkpoints/campaigns
+
+cep:
+  window: "5 minutes"
+  slide: "1 minute"
+  min_events: 10
+
+threshold_tuning:
+  threshold_min: 0.30
+  threshold_max: 0.95
+  threshold_step: 0.01
+  precision_constraint: 0.95

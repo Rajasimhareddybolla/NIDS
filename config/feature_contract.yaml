@@ -1,0 +1,37 @@
+required_columns:
+  - Destination Port
+  - Flow Duration
+  - SYN Flag Count
+  - ACK Flag Count
+  - FIN Flag Count
+  - Total Fwd Packets
+  - Total Backward Packets
+  - Fwd Packet Length Max
+  - Fwd Packet Length Min
+  - Fwd Packet Length Mean
+  - Bwd Packet Length Max
+  - Flow IAT Mean
+  - Flow IAT Max
+  - Flow IAT Min
+  - Label
+
+targeted_features:
+  - Destination Port
+  - Flow Duration
+  - SYN Flag Count
+  - ACK Flag Count
+  - FIN Flag Count
+
+numeric_feature_candidates:
+  - Total Fwd Packets
+  - Total Backward Packets
+  - Fwd Packet Length Max
+  - Fwd Packet Length Min
+  - Fwd Packet Length Mean
+  - Bwd Packet Length Max
+  - Flow IAT Mean
+  - Flow IAT Max
+  - Flow IAT Min
+
+optional_columns:
+  - Timestamp

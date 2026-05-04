@@ -1,0 +1,45 @@
+benchmark_profiles:
+  baseline:
+    - name: low
+      stream_max_rows: 2000
+      stream_sleep_ms: 2
+    - name: medium
+      stream_max_rows: 5000
+      stream_sleep_ms: 1
+    - name: high_local_safe
+      stream_max_rows: 10000
+      stream_sleep_ms: 0
+
+  sustained_ramp:
+    durations_minutes: [10, 10, 10, 10]
+    relative_to_local_ceiling: [0.5, 0.8, 1.0, 1.2]
+
+  burst_spike:
+    burst_duration_seconds: 30
+    recovery_window_seconds: 120
+    relative_to_local_ceiling: [2.0, 5.0, 10.0]
+
+  soak:
+    duration_minutes: 60
+    relative_to_local_ceiling: 0.7
+
+metrics_contract:
+  latency:
+    - end_to_end_latency_sec_p50
+    - end_to_end_latency_sec_p95
+    - end_to_end_latency_sec_p99
+  throughput:
+    - ingress_eps
+    - processed_eps
+    - persisted_eps
+  reliability:
+    - consumer_lag
+    - mongo_write_error_rate
+    - restart_recovery_time_sec
+  resources:
+    - host_cpu_percent
+    - host_memory_mb
+    - host_swap_pressure
+    - jvm_heap_usage
+    - jvm_gc_pause_ms
+    - spark_microbatch_duration_ms

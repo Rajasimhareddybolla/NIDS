@@ -1,0 +1,614 @@
+SYSTEM DESIGN DOCUMENT
+Real-Time Network Intrusion
+Detection System (NIDS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Domain:
+Big Data Analytics & Cybersecurity
+Dataset:
+CIC-IDS-2017 (Canadian Institute for Cybersecurity)
+Stack:
+Apache Kafka · PySpark · XGBoost · MongoDB · FastAPI
+Version:
+3.0 — Final (Interview Ready)
+1. Executive Summary
+This document defines the complete engineering specification for a distributed, Python-native, real-time machine learning pipeline engineered to detect cyber threats in high-velocity network telemetry. The system ingests live network flow data, applies a hybrid feature engineering and dimensionality reduction pipeline, classifies traffic using a tuned XGBoost model, and persists only confirmed threat incidents into MongoDB — eliminating benign traffic noise from the database layer entirely.
+The architecture was designed under three hard constraints:
+No storage bloat: 95%+ of network traffic is benign. The system must not persist this noise.
+No simulated streaming: A Kafka broker provides true decoupling between the data producer and the processing engine, with measurable latency and throughput.
+No black-box metrics: Every threshold, component value, and confidence score must be mathematically derived, not hardcoded.
+Core Design Philosophy
+Every dynamic value in this system — the PCA component count k, the XGBoost scale_pos_weight, the classification probability threshold, and the campaign confidence score — is computed at runtime from dataset statistics, not hardcoded in configuration files. This document specifies exactly how each value is derived.
+2. Architectural Trade-off Analysis
+Before establishing the final architecture, three alternative components were formally evaluated and rejected. This section documents the reasoning, which is a critical differentiator in a technical review context.
+2.1 Rejected: Hadoop (HDFS) for Cold Storage
+Hadoop Distributed File System was considered as a batch-training data lake. It was rejected for the following reasons:
+The CIC-IDS-2017 dataset is approximately 2.8 GB across 8 CSV files — orders of magnitude below the petabyte scale that justifies HDFS cluster overhead.
+HDFS introduces significant network I/O for block replication (default 3x) on a dataset that does not require fault-tolerant distributed storage.
+PySpark can read directly from a local or NFS-mounted filesystem for batch training without a Hadoop NameNode.
+2.2 Rejected: Apache Cassandra for High-Velocity Logging
+Cassandra was evaluated as the primary persistence layer due to its high write throughput. It was rejected because:
+The business objective is anomaly detection, not comprehensive traffic archival. Storing every benign packet creates a write amplification problem with no analytical value.
+Cassandra's rigid primary key schema (partition key + clustering key) conflicts with the polymorphic nature of different attack types, which vary significantly in their telemetry fields.
+By applying in-memory Spark filtering, only confirmed threat payloads (< 5% of total traffic) are written to the database layer, eliminating the volume problem entirely.
+2.3 Selected: Lean 4-Component Architecture
+Component
+Role
+Justification
+Apache Kafka
+Ingestion Buffer
+Decouples producer speed from consumer speed; provides disk-backed replay on OOM
+PySpark Structured Streaming
+Processing + ML Inference
+In-memory micro-batch execution; native stateful windowing; MLlib integration
+MongoDB
+Threat Persistence
+Schema-less documents handle polymorphic attack payloads without migrations
+FastAPI
+Stateless Query API
+Async I/O for dashboard queries; lightweight; no window state (CEP lives in Spark)
+3. Technology Stack & Data Pipeline
+3.1 Ingestion Layer: Apache Kafka
+Apache Kafka acts as the fault-tolerant, high-throughput message broker between the data source and the processing engine. Its role is to absorb traffic spikes and provide a replay buffer, preventing the Spark cluster from receiving uncapped volumetric input during attack simulations.
+Kafka Topic Configuration
+Parameter
+Value
+Rationale
+Topic Name
+network-telemetry
+Single topic; partitioned by source IP hash
+Partition Count
+8
+Matches default Spark executor parallelism; one partition per task slot
+Replication Factor
+1 (dev) / 3 (prod)
+1 for local dev; 3 for fault tolerance in production cluster
+Retention Policy
+retention.ms = 3600000
+1-hour disk retention; unprocessed packets survive Spark restarts
+Message Key
+source_ip (hashed)
+Co-locates flows from same source IP into the same partition for CEP ordering
+Kafka Producer — CIC-IDS-2017 Simulation
+The Python producer reads CIC-IDS-2017 CSV rows and publishes them to the Kafka topic, simulating a live network tap. The producer rate is configurable to simulate varying attack intensities.
+# kafka_producer.py
+from kafka import KafkaProducer
+import pandas as pd, json, time
+producer = KafkaProducer(
+bootstrap_servers=['localhost:9092'],
+value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+key_serializer=lambda k: k.encode('utf-8')
+)
+df = pd.read_csv('data/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv')
+for _, row in df.iterrows():
+record = row.to_dict()
+# Key by source IP for partition co-location
+key = str(record.get(' Source IP', 'unknown'))
+producer.send('network-telemetry', key=key, value=record)
+time.sleep(0.001)  # Simulate ~1000 flows/second
+producer.flush()
+3.2 Processing Engine: PySpark Structured Streaming
+PySpark is the core computational engine. It subscribes to the Kafka topic, applies the full ML inference pipeline, performs stateful CEP windowing, and routes confirmed threats to MongoDB.
+Critical Backpressure Configuration
+During volumetric DDoS simulations, the Kafka producer rate can spike beyond PySpark's processing capacity. Without backpressure, this causes Out-Of-Memory (OOM) crashes. The following two parameters are mandatory:
+spark = SparkSession.builder \
+.appName('NIDS-Streaming') \
+.config('spark.streaming.backpressure.enabled', 'true') \
+.config('spark.sql.streaming.kafka.useDeprecatedOffsetFetching', 'false') \
+.getOrCreate()
+# maxOffsetsPerTrigger caps intake per micro-batch
+# Value = (target_rows_per_second) * (trigger_interval_seconds)
+# Example: 10,000 flows/sec * 5sec trigger = 50,000 max offsets
+stream_df = spark.readStream \
+.format('kafka') \
+.option('kafka.bootstrap.servers', 'localhost:9092') \
+.option('subscribe', 'network-telemetry') \
+.option('maxOffsetsPerTrigger', 50000) \
+.option('startingOffsets', 'latest') \
+.load()
+3.3 Persistence Layer: MongoDB
+MongoDB stores only confirmed malicious incident documents. The schema-less document model is chosen because different attack types (DDoS, Port Scan, Brute Force) have fundamentally different telemetry shapes that cannot be normalized into a flat relational table without excessive NULL columns.
+MongoDB Configuration
+Setting
+Value
+Purpose
+Collection
+security_incidents
+Primary threat event storage
+Collection
+attack_campaigns
+Aggregated CEP campaign objects from Spark windowing
+Index
+{ timestamp: -1 }
+Descending time index for dashboard time-range queries
+Index
+{ attacker_ip: 1, timestamp: -1 }
+Compound index for per-IP campaign history queries
+TTL Index
+{ timestamp: 1 }, expireAfterSeconds: 2592000
+Auto-expire incidents older than 30 days to prevent storage bloat
+Write Concern
+w: 1, j: true
+Acknowledged write with journal flush for incident durability
+3.4 Application Layer: FastAPI
+FastAPI is a deliberately stateless query layer. It performs no windowing or aggregation logic — those operations are handled entirely within the PySpark layer. FastAPI reads pre-aggregated campaign documents from MongoDB and serves them to security dashboards via async REST endpoints.
+# main.py — FastAPI stateless query layer
+from fastapi import FastAPI
+from motor.motor_asyncio import AsyncIOMotorClient
+from datetime import datetime, timedelta
+app = FastAPI()
+client = AsyncIOMotorClient('mongodb://localhost:27017')
+db = client.nids
+@app.get('/campaigns/recent')
+async def get_recent_campaigns(hours: int = 1):
+cutoff = datetime.utcnow() - timedelta(hours=hours)
+cursor = db.attack_campaigns.find(
+{'timestamp_start': {'$gte': cutoff}},
+sort=[('timestamp_start', -1)]
+)
+return await cursor.to_list(length=100)
+@app.get('/campaigns/{attacker_ip}')
+async def get_ip_history(attacker_ip: str):
+cursor = db.attack_campaigns.find(
+{'attacker_ip': attacker_ip},
+sort=[('timestamp_start', -1)]
+)
+return await cursor.to_list(length=50)
+4. Machine Learning & Feature Engineering
+4.1 Dataset Profile: CIC-IDS-2017
+Understanding the dataset's statistical properties is mandatory before any feature engineering decisions. These numbers directly drive the dynamic parameter calculations in subsequent sections.
+Property
+Value
+Implication
+Total Records
+~2.8M flows
+Sufficient for robust XGBoost training without augmentation
+Total Features
+78 raw features
+Curse of dimensionality risk; PCA required
+Benign Traffic
+~80% of total
+Extreme class imbalance; scale_pos_weight ≈ 4.0
+Attack Traffic
+~20% of total
+Minority class; per-class F1 is the only valid success metric
+Attack Types
+DDoS, PortScan, BruteForce, Web Attacks, Infiltration
+Multiclass problem; binary label simplification reduces nuance
+Temporal Structure
+Monday–Friday traffic captures
+Chronological train/test split is mandatory to prevent data leakage
+4.2 Dynamic Parameter #1: XGBoost scale_pos_weight
+This is the single most important dynamic value in the ML pipeline. It cannot be hardcoded.
+Why This Cannot Be Hardcoded
+The scale_pos_weight parameter mathematically controls how much the gradient descent penalizes a False Negative (missed attack) versus a False Positive (benign flagged as attack). Setting it incorrectly — even to a 'reasonable' estimate — biases the model either toward alert fatigue or toward missing attacks entirely. It must be computed from the actual label distribution of the training split.
+Mathematical Definition
+XGBoost documentation defines the optimal value as:
+scale_pos_weight  =  count(Benign Samples)  ÷  count(Attack Samples)
+Runtime Computation Code
+# compute_class_weights.py
+# Run ONCE during the batch training phase.
+# The computed value is saved to config and loaded by the streaming job.
+from pyspark.sql import SparkSession
+import json
+spark = SparkSession.builder.appName('ClassWeightCalc').getOrCreate()
+# Load the TRAINING split only (70% chronological)
+train_df = spark.read.csv('data/train_split/', header=True, inferSchema=True)
+# Compute label distribution
+label_counts = train_df.groupBy('Label').count().collect()
+counts = {row['Label']: row['count'] for row in label_counts}
+benign_count  = counts.get('BENIGN', 0)
+attack_count  = sum(v for k, v in counts.items() if k != 'BENIGN')
+# Compute the dynamic weight
+scale_pos_weight = benign_count / attack_count
+print(f'Benign: {benign_count:,}  |  Attack: {attack_count:,}')
+print(f'scale_pos_weight = {scale_pos_weight:.4f}')
+# Expected output: scale_pos_weight ≈ 4.0 for CIC-IDS-2017
+# Persist to config file for the training script to consume
+with open('config/dynamic_params.json', 'w') as f:
+json.dump({'scale_pos_weight': scale_pos_weight}, f, indent=2)
+4.3 Hybrid Feature Engineering Pipeline
+The 78 raw CIC-IDS-2017 features are processed through a two-track hybrid pipeline. This design preserves absolute network logic signals while mathematically compressing the high-dimensional numerical feature space.
+Track 1: Targeted Feature Extraction (Bypass PCA)
+These features encode hard network protocol rules. Running them through PCA would mathematically blend them with unrelated packet-length features, destroying their signal fidelity. They are extracted directly.
+Feature Name
+CIC-IDS-2017 Column
+Attack Relevance
+Destination Port
+Destination Port
+Port 22 → SSH Brute Force; Port 80/443 → Web Attack; Port 53 → DNS Amplification
+SYN Flag Count
+SYN Flag Cnt
+High SYN with low ACK ratio = SYN Flood DDoS signature
+ACK Flag Count
+ACK Flag Cnt
+Asymmetric SYN/ACK ratio confirms half-open connection flooding
+Flow Duration
+Flow Duration
+Near-zero duration = Port Scan; Extended duration = Data Exfiltration
+Fwd Packet Length Max
+Fwd Packet Length Max
+Oversized forward packets indicate payload injection or exfiltration
+Track 2: PCA with Dynamic k-Selection (95% Variance Targeting)
+The remaining ~60 numerical features (packet length statistics, inter-arrival times, flow byte rates) are routed through PCA. The number of components k is not hardcoded. It is computed dynamically to retain exactly 95% of the mathematical variance in the training data.
+# pca_k_selection.py
+# Determines the minimum k that retains 95% of variance.
+# Run during batch training; k is saved to dynamic_params.json.
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+import numpy as np, json
+NUMERICAL_FEATURES = [
+'Flow Bytes/s', 'Flow Packets/s', 'Flow IAT Mean', 'Flow IAT Std',
+'Fwd IAT Total', 'Bwd IAT Total', 'Packet Length Mean',
+'Packet Length Std', 'Packet Length Variance',
+# ... all remaining ~60 numerical features
+]
+# Step 1: Assemble and normalize
+assembler = VectorAssembler(inputCols=NUMERICAL_FEATURES, outputCol='raw_features')
+scaler    = StandardScaler(inputCol='raw_features', outputCol='scaled_features',
+withStd=True, withMean=True)
+assembled_df = assembler.transform(train_df)
+scaler_model = scaler.fit(assembled_df)
+scaled_df    = scaler_model.transform(assembled_df)
+# Step 2: Fit full PCA (k = total features) to get all eigenvalues
+pca_full = PCA(k=len(NUMERICAL_FEATURES), inputCol='scaled_features', outputCol='pca_out')
+pca_full_model = pca_full.fit(scaled_df)
+# Step 3: Compute cumulative explained variance
+explained_variance = pca_full_model.explainedVariance.toArray()
+cumulative_variance = np.cumsum(explained_variance)
+# Step 4: Find minimum k that exceeds 95% threshold
+TARGET_VARIANCE = 0.95
+k_optimal = int(np.argmax(cumulative_variance >= TARGET_VARIANCE)) + 1
+print(f'Optimal k = {k_optimal} retains {cumulative_variance[k_optimal-1]*100:.2f}% variance')
+# Expected output for CIC-IDS-2017: k ≈ 12-15
+# Save k to config
+with open('config/dynamic_params.json', 'r+') as f:
+params = json.load(f)
+params['pca_k'] = k_optimal
+params['pca_variance_retained'] = float(cumulative_variance[k_optimal-1])
+f.seek(0)
+json.dump(params, f, indent=2)
+4.4 Algorithm Selection: XGBoost
+Why XGBoost Over Random Forest and Logistic Regression
+Algorithm
+Class Imbalance Handling
+Speed
+Verdict
+Logistic Regression
+None natively; requires SMOTE oversampling
+Fast
+Rejected — linear boundary misses complex attack signatures
+Random Forest
+Partial via class_weight, but all trees are independent
+Medium
+Rejected — no mechanism to focus subsequent trees on hard minority samples
+XGBoost
+scale_pos_weight directly adjusts gradient penalty for minority class
+Fast (JVM/native)
+Selected — gradient boosting focuses iteratively on misclassified attacks
+The Core Mathematical Argument
+In gradient boosting, each sequential tree is trained on the residuals of the previous ensemble. When scale_pos_weight is set to the benign/attack ratio (≈ 4.0), the loss function is modified so that a False Negative on an attack sample contributes 4× more to the gradient update than a False Positive. This forces each subsequent tree to disproportionately focus on the attack samples the previous trees failed to classify — exactly the iterative correction needed for a minority-class problem.
+4.5 Dynamic Parameter #2: Classification Probability Threshold
+XGBoost outputs a continuous probability score (0.0 – 1.0) for each flow. A threshold value converts this into a binary classification. This threshold is not set at 0.5 by default — it is tuned against the validation set.
+The Alert Fatigue Problem
+Setting the threshold too low (e.g., 0.3) maximizes Recall but floods the SOC with False Positives. Security analysts then ignore alerts. Setting it too high (e.g., 0.9) reduces False Positives but misses real attacks. The threshold must be tuned to achieve Precision > 0.95 on the validation set, ensuring every written alert is highly actionable.
+# threshold_tuning.py
+# Sweeps probability thresholds on the validation set to find the
+# optimal operating point: Precision > 0.95 while maximizing F1.
+from sklearn.metrics import precision_recall_fscore_support
+import numpy as np, json
+# y_proba: XGBoost predict_proba output on the 30% validation set
+# y_true: actual labels from validation set
+thresholds  = np.arange(0.3, 0.95, 0.01)
+best_threshold = 0.5
+best_f1        = 0.0
+for t in thresholds:
+y_pred = (y_proba >= t).astype(int)
+precision, recall, f1, _ = precision_recall_fscore_support(
+y_true, y_pred, average='binary', zero_division=0
+)
+# Constraint: Precision must exceed 0.95
+if precision >= 0.95 and f1 > best_f1:
+best_f1        = f1
+best_threshold = t
+print(f'Optimal threshold: {best_threshold:.2f} | F1: {best_f1:.4f}')
+# Persist to config
+with open('config/dynamic_params.json', 'r+') as f:
+params = json.load(f)
+params['classification_threshold'] = float(best_threshold)
+params['validation_f1']            = float(best_f1)
+f.seek(0)
+json.dump(params, f, indent=2)
+5. Execution Workflows
+5.1 Phase 1: Batch Training (Offline)
+The training phase runs once on historical data. Its primary output is not just a trained model but also the dynamic_params.json configuration file containing all computed parameters.
+Chronological Train/Test Split — Preventing Data Leakage
+The dataset must be split chronologically (Monday–Thursday = Train, Friday = Validation), NOT randomly. Random splitting allows the model to train on Friday's DDoS traffic while being tested on Thursday's — a form of temporal data leakage that produces falsely optimistic metrics.
+# train_test_split.py
+# CIC-IDS-2017 files are named by day of the week.
+# Split enforced by file selection, not by random sampling.
+TRAIN_FILES = [
+'Monday-WorkingHours.pcap_ISCX.csv',
+'Tuesday-WorkingHours.pcap_ISCX.csv',
+'Wednesday-workingHours.pcap_ISCX.csv',
+'Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv',
+'Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv',
+]
+VALIDATION_FILES = [
+'Friday-WorkingHours-Morning.pcap_ISCX.csv',
+'Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv',
+'Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv',
+]
+Full Training Pipeline Execution Order
+Run compute_class_weights.py → Computes scale_pos_weight → Writes to dynamic_params.json: Step 1
+Run pca_k_selection.py → Computes optimal k and variance retained → Appends to dynamic_params.json: Step 2
+Run train_model.py → Loads dynamic_params.json → Trains full Spark MLlib PipelineModel → Saves PipelineModel to disk: Step 3
+Run threshold_tuning.py → Evaluates model on validation set → Computes optimal threshold → Appends to dynamic_params.json: Step 4
+Verify dynamic_params.json contains all four values: scale_pos_weight, pca_k, pca_variance_retained, classification_threshold: Step 5
+5.2 Phase 2: Real-Time Inferencing (Streaming)
+The streaming job loads the saved PipelineModel and dynamic_params.json at startup. Every micro-batch arriving from Kafka passes through the same transformation pipeline that was fitted during training, ensuring mathematical consistency between offline training and online inference.
+# streaming_inference.py
+from pyspark.sql import SparkSession
+from pyspark.ml import PipelineModel
+from pyspark.sql.functions import (col, from_json, window,
+count, avg, current_timestamp)
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+import json
+# Load dynamic parameters computed during training
+with open('config/dynamic_params.json') as f:
+params = json.load(f)
+THRESHOLD = params['classification_threshold']
+print(f'Loaded classification threshold: {THRESHOLD}')
+spark = SparkSession.builder \
+.appName('NIDS-Streaming') \
+.config('spark.streaming.backpressure.enabled', 'true') \
+.getOrCreate()
+# Load the fitted PipelineModel (includes Scaler + PCA + XGBoost)
+model = PipelineModel.load('models/nids_pipeline_model')
+# Read from Kafka
+raw_stream = spark.readStream \
+.format('kafka') \
+.option('kafka.bootstrap.servers', 'localhost:9092') \
+.option('subscribe', 'network-telemetry') \
+.option('maxOffsetsPerTrigger', 50000) \
+.load()
+# Deserialize JSON payload from Kafka value field
+flow_schema = StructType([  # Define all 78 CIC-IDS-2017 fields
+StructField('Destination Port', DoubleType()),
+StructField('Flow Duration', DoubleType()),
+StructField('SYN Flag Cnt', DoubleType()),
+StructField('ACK Flag Cnt', DoubleType()),
+# ... all remaining fields
+StructField('Source IP', StringType()),
+StructField('Timestamp', StringType()),
+])
+flows_df = raw_stream.select(
+from_json(col('value').cast('string'), flow_schema).alias('flow')
+).select('flow.*')
+# Apply the full inference pipeline
+predictions_df = model.transform(flows_df)
+# Apply dynamic threshold from training phase
+threats_df = predictions_df.filter(
+col('probability')[1] >= THRESHOLD  # XGBoost probability for class 1 (Attack)
+)
+6. Complex Event Processing (CEP) in PySpark
+CEP is not performed in FastAPI. It is performed natively within PySpark's Structured Streaming engine using stateful windowing. This ensures that window state survives micro-batch failures via Spark's checkpoint mechanism.
+6.1 Why CEP Must Live in PySpark (Not FastAPI)
+Architectural Correctness
+FastAPI is a stateless HTTP server. It holds no memory between requests. If a 5-minute sliding window was implemented in FastAPI and the process restarted at minute 3, all accumulated event state would be lost. PySpark Structured Streaming persists window state to a checkpoint directory, making the aggregation fault-tolerant by design.
+6.2 Stateful Sliding Window Implementation
+# CEP windowing in PySpark Structured Streaming
+# Aggregates individual threat events into Attack Campaign objects
+from pyspark.sql.functions import window, count, avg, collect_list, first
+campaigns_df = threats_df \
+.withColumn('event_time', col('Timestamp').cast('timestamp')) \
+.groupBy(
+window(col('event_time'), '5 minutes', '1 minute'),  # 5-min window, 1-min slide
+col('Source IP').alias('attacker_ip')
+) \
+.agg(
+count('*').alias('aggregated_events'),
+avg(col('probability')[1]).alias('confidence_score'),  # Mean posterior probability
+first('threat_classification').alias('primary_threat'),
+collect_list('threat_classification').alias('all_threat_types'),
+) \
+.filter(col('aggregated_events') >= 10)  # Minimum event threshold for a 'campaign'
+# Write campaign objects to MongoDB
+campaigns_df.writeStream \
+.foreachBatch(write_campaigns_to_mongo) \
+.option('checkpointLocation', 'checkpoints/campaigns') \
+.trigger(processingTime='30 seconds') \
+.start()
+6.3 Dynamic Parameter #3: Campaign Confidence Score
+The confidence_score field in the MongoDB campaign document is not a hardcoded number. It is the mean XGBoost posterior probability across all aggregated events within the window.
+confidence_score  =  (1/n)  ×  Σ  predict_proba(flow_i)[attack_class]
+Where n is the number of individual threat events aggregated into the campaign window. A campaign with confidence_score = 0.992 means that on average, XGBoost assigned 99.2% attack probability to the 50 flows from that source IP in that 5-minute window.
+7. Database Schema & Document Models
+7.1 security_incidents Collection
+Individual threat events written by PySpark immediately when a flow exceeds the classification threshold. Written before windowing aggregation.
+{
+'incident_id':           'UUID-v4-String',
+'timestamp':             'ISO-8601 DateTime (UTC)',
+'threat_classification': 'DDoS - SYN Flood | PortScan | BruteForce | WebAttack',
+'confidence':            0.9920,  // XGBoost predict_proba for attack class
+'mitre_attack_mapping': {
+'tactic':              'Initial Access (TA0001)',
+'technique_id':        'T1078',
+'technique_name':      'Valid Accounts'
+},
+'network_identifiers': {
+'source_ip':           '192.168.1.50',
+'destination_ip':      '192.168.0.10',
+'target_port':         22,
+'protocol':            'TCP'
+},
+'flow_telemetry': {
+'duration_ms':         15420,
+'total_packets':       847,
+'syn_flag_count':      712,
+'ack_flag_count':      8,
+'flow_bytes_per_sec':  95400.0
+}
+}
+7.2 attack_campaigns Collection
+Aggregated campaign objects written by PySpark's CEP windowing layer. These are the primary documents served by the FastAPI dashboard layer.
+{
+'campaign_id':           'CMP-{hash(attacker_ip + window_start)}',
+'timestamp_start':       'ISO-8601 DateTime (window open)',
+'timestamp_end':         'ISO-8601 DateTime (window close)',
+'threat_classification': 'Coordinated Recon & Brute Force',
+'attacker_ip':           '192.168.1.50',
+'mitre_attack_mapping': {
+'tactic':              'Discovery (TA0007)',
+'technique_id':        'T1046',
+'technique_name':      'Network Service Discovery'
+},
+'aggregated_events':     51,
+'confidence_score':      0.9920,  // Mean predict_proba across 51 events — NOT hardcoded
+'all_threat_types':      ['PortScan', 'PortScan', 'BruteForce', '...'],
+'window_duration_sec':   300
+}
+7.3 MITRE ATT&CK Mapping Logic
+The MITRE ATT&CK mapping is not a simple string lookup. It is a rule-based mapping function that evaluates the combination of threat_classification and target_port to determine the most specific applicable technique.
+# mitre_mapping.py
+# Maps XGBoost threat classifications to MITRE ATT&CK techniques.
+# Scoped strictly to CIC-IDS-2017 attack types (no ATLAS — out of scope).
+MITRE_RULES = [
+# Rule format: (threat_class_contains, target_port, tactic, technique_id, technique_name)
+('DDoS',       None,  'Impact (TA0040)',        'T1498',  'Network Denial of Service'),
+('PortScan',   None,  'Discovery (TA0007)',     'T1046',  'Network Service Discovery'),
+('BruteForce', 22,    'Credential Access (TA0006)', 'T1110.001', 'Brute Force: Password Guessing'),
+('BruteForce', 21,    'Credential Access (TA0006)', 'T1110.001', 'Brute Force: Password Guessing'),
+('BruteForce', None,  'Credential Access (TA0006)', 'T1110',     'Brute Force'),
+('WebAttack',  80,    'Initial Access (TA0001)',    'T1190',     'Exploit Public-Facing Application'),
+('WebAttack',  443,   'Initial Access (TA0001)',    'T1190',     'Exploit Public-Facing Application'),
+('Infiltration', None,'Exfiltration (TA0010)',      'T1041',     'Exfiltration Over C2 Channel'),
+]
+def map_to_mitre(threat_class: str, target_port: int) -> dict:
+for rule_class, rule_port, tactic, tech_id, tech_name in MITRE_RULES:
+class_match = rule_class.lower() in threat_class.lower()
+port_match  = (rule_port is None) or (rule_port == target_port)
+if class_match and port_match:
+return {'tactic': tactic, 'technique_id': tech_id, 'technique_name': tech_name}
+return {'tactic': 'Unknown', 'technique_id': 'T0000', 'technique_name': 'Unclassified'}
+8. Scalability & Failure Mode Analysis
+8.1 Throughput & Latency Targets
+Metric
+Target
+Mechanism
+End-to-End Latency
+< 5 seconds (Kafka ingest → MongoDB write)
+Micro-batch trigger interval = 5s; in-memory transform
+Throughput
+10,000 flows/second sustained
+maxOffsetsPerTrigger = 50,000 per 5s trigger
+Peak Spike Handling
+100,000 flows/second (DDoS burst)
+Kafka disk buffer absorbs spike; Spark drains at controlled rate
+MongoDB Write Rate
+< 500 documents/second (5% attack rate)
+Only confirmed threats written; benign traffic discarded in-memory
+8.2 Failure Mode Registry
+Failure Mode
+Impact
+Defense Mechanism
+Spark OOM during DDoS spike
+Cluster crash; data loss
+backpressure.enabled=true + maxOffsetsPerTrigger caps memory intake
+Spark job restart
+CEP window state lost
+checkpointLocation persists window state to disk; resumes on restart
+MongoDB write timeout
+Threat incident lost
+foreachBatch with retry logic; failed batches retried up to 3 times
+Kafka broker restart
+Producer messages lost during gap
+Kafka retention.ms=3600000 replays 1 hour of unacknowledged messages
+FastAPI pod restart
+Zero state lost
+FastAPI is stateless; all state lives in MongoDB; queries resume immediately
+8.3 Horizontal Scaling Path
+The architecture scales linearly along three axes:
+Kafka throughput scales by increasing partition count. Each additional Spark executor can consume one additional partition in parallel.
+PySpark throughput scales by adding executor cores to the cluster. The PipelineModel.transform() call is embarrassingly parallel across partitions.
+MongoDB write throughput scales by enabling sharding on the security_incidents collection with attacker_ip as the shard key, distributing writes across multiple shard nodes.
+9. Evaluation Framework
+9.1 Why Aggregate Accuracy Is Meaningless
+On CIC-IDS-2017, where 80% of traffic is benign, a model that predicts BENIGN for every single flow achieves 80% accuracy. This is the null classifier. Aggregate accuracy must never be used as a success metric for this system.
+9.2 Required Metrics
+Metric
+Formula
+Target
+Rationale
+Per-Class F1 (DDoS)
+2×P×R / (P+R)
+> 0.95
+Validates model is actively detecting DDoS, not hiding in benign volume
+Per-Class F1 (PortScan)
+2×P×R / (P+R)
+> 0.93
+Port Scan is subtle; lower threshold acceptable
+Per-Class F1 (BruteForce)
+2×P×R / (P+R)
+> 0.95
+BruteForce has clearest signature; high F1 expected
+Precision (Attack class)
+TP / (TP+FP)
+> 0.95
+Ensures every MongoDB write is an actionable alert, not noise
+False Positive Rate
+FP / (FP+TN)
+< 0.01
+Limits SOC alert fatigue to < 1% of benign traffic
+9.3 Evaluation Code
+# evaluate_model.py
+from sklearn.metrics import classification_report, confusion_matrix
+import pandas as pd
+# y_true: actual labels from validation set (Friday files)
+# y_pred: model predictions with optimal threshold applied
+# Per-class report — this is the ONLY metric that matters
+report = classification_report(
+y_true, y_pred,
+target_names=['BENIGN', 'DDoS', 'PortScan', 'BruteForce', 'WebAttack'],
+output_dict=True
+)
+print('=== Per-Class F1 Scores ===')
+for cls in ['DDoS', 'PortScan', 'BruteForce', 'WebAttack']:
+f1 = report[cls]['f1-score']
+print(f'{cls:15s}: F1 = {f1:.4f}  {'PASS' if f1 > 0.93 else 'FAIL'}')
+10. Dynamic Parameters — Complete Reference
+This section is the definitive reference for every dynamic value in the system. No parameter in this table should ever be hardcoded in the streaming or inference scripts.
+Parameter
+Script That Computes It
+Where It Is Used
+Expected Range
+scale_pos_weight
+compute_class_weights.py
+XGBoost training configuration (xgb_params dict)
+3.5 – 4.5 for CIC-IDS-2017
+pca_k
+pca_k_selection.py
+PCA(k=pca_k) in MLlib Pipeline definition
+12 – 18 for 95% variance target
+pca_variance_retained
+pca_k_selection.py
+Logged for audit; shown in evaluation report
+0.95 – 0.97
+classification_threshold
+threshold_tuning.py
+streaming_inference.py filter condition on probability[1]
+0.55 – 0.80 typically
+confidence_score
+PySpark avg() in CEP window
+attack_campaigns MongoDB document field
+Mean of all predict_proba in window
+dynamic_params.json — Expected Final State After Training
+{
+  "scale_pos_weight": 4.02,
+  "pca_k": 14,
+  "pca_variance_retained": 0.9531,
+  "classification_threshold": 0.67,
+  "validation_f1_ddos": 0.9712,
+  "validation_f1_portscan": 0.9438,
+  "validation_f1_bruteforce": 0.9601
+}
+End of Document
+Real-Time NIDS — System Design Document v3.0
