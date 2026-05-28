@@ -1,0 +1,14 @@
+.venv/bin/python3 scripts/stream_kafka_inference_consumer.py
+Mongo connected: mongodb://localhost:27017/nids.security_incidents
+Consuming topic=network-telemetry-h2h-python-1777527710 bootstrap=localhost:9092 threshold=0.01 feature_space=raw_numeric
+processed=1000 threats=3 rate=126.1/s
+processed=2000 threats=6 rate=183.2/s
+processed=3000 threats=9 rate=215.0/s
+processed=4000 threats=18 rate=233.4/s
+processed=5000 threats=20 rate=249.4/s
+processed=6000 threats=24 rate=260.4/s
+processed=7000 threats=34 rate=268.1/s
+processed=8000 threats=42 rate=275.4/s
+processed=9000 threats=46 rate=281.6/s
+processed=10000 threats=50 rate=286.3/s
+Finished: processed=10000 threats=50

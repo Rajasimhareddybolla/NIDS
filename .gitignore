@@ -6,10 +6,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
-# Logs
-logs/
-*.log
+node_modules/
 
 # Checkpoints & Models
 checkpoints/
@@ -55,3 +52,6 @@ MANIFEST
 # VS Code
 .vscode/
 *.code-workspace
+
+# OS
+.DS_Store
