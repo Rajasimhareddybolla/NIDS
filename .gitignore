@@ -55,3 +55,9 @@ MANIFEST
 
 # OS
 .DS_Store
+
+# Certificates and Keys
+*.pem
+*.key
+*.p12
+*.pfx
